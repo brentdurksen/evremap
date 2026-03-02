@@ -6,6 +6,12 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::Duration;
 
+#[derive(Clone, Debug)]
+struct DeferredKey {
+    key: KeyCode,
+    active_with: HashSet<KeyCode>,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum KeyEventType {
     Release,
@@ -61,6 +67,8 @@ pub struct InputMapper {
     tapping: Option<KeyCode>,
 
     output_keys: HashSet<KeyCode>,
+
+    deferred_dual_role_keys: Vec<DeferredKey>,
 }
 
 fn enable_key_code(input: &mut Device, key: KeyCode) -> Result<()> {
@@ -112,6 +120,7 @@ impl InputMapper {
             output_keys: HashSet::new(),
             tapping: None,
             mappings,
+            deferred_dual_role_keys: Vec::new(),
         })
     }
 
@@ -138,8 +147,13 @@ impl InputMapper {
 
     /// Compute the effective set of keys that are pressed
     fn compute_keys(&self) -> HashSet<KeyCode> {
-        // Start with the input keys
-        let mut keys: HashSet<KeyCode> = self.input_state.keys().cloned().collect();
+        // Start with the input keys plus any deferred dual role keys
+        let mut keys: HashSet<KeyCode> = self
+            .input_state
+            .keys()
+            .cloned()
+            .chain(self.deferred_dual_role_keys.iter().map(|d| d.key.clone()))
+            .collect();
 
         // First phase is to apply any DualRole mappings as they are likely to
         // be used to produce modifiers when held.
@@ -286,6 +300,21 @@ impl InputMapper {
                     }
                     Some(p) => p,
                 };
+
+                let is_dual_role = self.lookup_dual_role_mapping(code.clone()).is_some();
+                if is_dual_role && !self.input_state.is_empty() {
+                    self.deferred_dual_role_keys.retain(|d| d.key != code);
+                    self.deferred_dual_role_keys.push(DeferredKey {
+                        key: code.clone(),
+                        active_with: self.input_state.keys().cloned().collect(),
+                    });
+                }
+
+                self.deferred_dual_role_keys.retain(|d| {
+                    d.active_with
+                        .iter()
+                        .any(|k| self.input_state.contains_key(k))
+                });
 
                 self.compute_and_apply_keys(&event.time)?;
 
