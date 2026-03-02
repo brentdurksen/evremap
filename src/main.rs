@@ -3,7 +3,10 @@ use crate::mapping::*;
 use crate::remapper::*;
 use anyhow::{Context, Result};
 use clap::Parser;
+use inotify::{EventMask, Inotify, WatchMask};
+use std::collections::HashSet;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 mod deviceinfo;
@@ -62,6 +65,15 @@ enum Opt {
         /// but is simpler to setup ad-hoc.
         #[arg(long)]
         wait_for_device: bool,
+
+        /// Grab ALL keyboard devices rather than the single device
+        /// specified by device_name / the config file.
+        /// When this flag is set, device_name (in config or CLI) is
+        /// ignored.  New keyboards plugged in while running will be
+        /// picked up automatically; disconnected keyboards are
+        /// handled gracefully.
+        #[arg(long)]
+        all_keyboards: bool,
     },
 }
 
@@ -144,6 +156,94 @@ fn debug_events(device: DeviceInfo) -> Result<()> {
     }
 }
 
+/// Spawn a thread that runs an InputMapper for `path`.
+/// When the device is disconnected (or any other error occurs) the thread
+/// logs the reason, removes the path from `active`, and exits cleanly.
+fn spawn_mapper_thread(
+    path: PathBuf,
+    mappings: Vec<Mapping>,
+    active: Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    std::thread::spawn(move || {
+        log::info!("Starting remapper for {}", path.display());
+        match InputMapper::create_mapper(&path, mappings) {
+            Err(err) => {
+                log::error!("Failed to create mapper for {}: {:#}", path.display(), err);
+            }
+            Ok(mut mapper) => {
+                if let Err(err) = mapper.run_mapper() {
+                    log::warn!("Remapper for {} stopped: {:#}", path.display(), err);
+                }
+            }
+        }
+        let mut active = active.lock().unwrap();
+        active.remove(&path);
+        log::info!("Remapper thread for {} exited", path.display());
+    });
+}
+
+/// Run the remapper over all keyboard devices, watching for hot-plug events
+/// via inotify so newly connected keyboards are picked up automatically.
+fn run_all_keyboards(mappings: Vec<Mapping>) -> Result<()> {
+    // Set of device paths currently being managed.
+    let active: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    // Grab all keyboards that are present right now.
+    let keyboards = DeviceInfo::all_keyboards()?;
+    if keyboards.is_empty() {
+        log::warn!("No keyboard devices found at startup — waiting for one to be plugged in");
+    }
+    for dev in keyboards {
+        let mut guard = active.lock().unwrap();
+        if guard.insert(dev.path.clone()) {
+            spawn_mapper_thread(dev.path, mappings.clone(), Arc::clone(&active));
+        }
+    }
+
+    // Watch /dev/input for newly created event nodes.
+    let mut inotify = Inotify::init().context("initialising inotify")?;
+    inotify
+        .watches()
+        .add("/dev/input", WatchMask::CREATE)
+        .context("adding inotify watch on /dev/input")?;
+
+    let mut buffer = [0u8; 16384];
+    loop {
+        let events = inotify
+            .read_events_blocking(&mut buffer)
+            .context("reading inotify events")?;
+
+        for event in events {
+            if !event.mask.contains(EventMask::CREATE) {
+                continue;
+            }
+            let name = match event.name {
+                Some(n) => n.to_string_lossy().into_owned(),
+                None => continue,
+            };
+            if !name.starts_with("event") {
+                continue;
+            }
+
+            let path = PathBuf::from("/dev/input").join(&name);
+
+            // Small delay: the kernel creates the node before the device is
+            // fully initialised, so opening it immediately can fail.
+            std::thread::sleep(Duration::from_millis(200));
+
+            if !DeviceInfo::path_is_keyboard(&path) {
+                continue;
+            }
+
+            let mut guard = active.lock().unwrap();
+            if guard.insert(path.clone()) {
+                log::info!("New keyboard detected: {}", path.display());
+                spawn_mapper_thread(path, mappings.clone(), Arc::clone(&active));
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     setup_logger();
     let opt = Opt::parse();
@@ -161,6 +261,7 @@ fn main() -> Result<()> {
             device_name,
             phys,
             wait_for_device,
+            all_keyboards,
         } => {
             let mut mapping_config = MappingConfig::from_file(&config_file).context(format!(
                 "loading MappingConfig from {}",
@@ -174,11 +275,23 @@ fn main() -> Result<()> {
                 mapping_config.phys = Some(phys);
             }
 
+            if all_keyboards {
+                if wait_for_device {
+                    log::warn!(
+                        "--wait-for-device has no effect with --all-keyboards; \
+                        new keyboards are always picked up automatically"
+                    );
+                }
+                log::warn!("Short delay: release any keys now!");
+                std::thread::sleep(Duration::from_secs_f64(delay));
+                return run_all_keyboards(mapping_config.mappings);
+            }
+
             let device_name = mapping_config.device_name.as_deref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "device_name is missing; \
                         specify it either in the config file or via the --device-name \
-                        command line option"
+                        command line option, or use --all-keyboards to remap all keyboards"
                 )
             })?;
 

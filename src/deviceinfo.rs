@@ -1,13 +1,18 @@
 use anyhow::{bail, Context, Result};
-use evdev_rs::{Device, DeviceWrapper};
+use evdev_rs::{
+    enums::{EventCode, EventType, EV_KEY as KeyCode},
+    Device, DeviceWrapper,
+};
 use std::cmp::Ordering;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
     pub name: String,
     pub path: PathBuf,
     pub phys: String,
+    /// True if the device looks like a keyboard (has EV_KEY + KEY_A).
+    pub is_keyboard: bool,
 }
 
 impl DeviceInfo {
@@ -19,6 +24,7 @@ impl DeviceInfo {
         Ok(Self {
             name: input.name().unwrap_or("").to_string(),
             phys: input.phys().unwrap_or("").to_string(),
+            is_keyboard: device_is_keyboard(&input),
             path,
         })
     }
@@ -65,6 +71,28 @@ impl DeviceInfo {
         Ok(devices_with_name.remove(0))
     }
 
+    /// Returns true if the device at `path` looks like a keyboard.
+    /// Used during hot-plug when we only have a path and haven't yet built
+    /// a full `DeviceInfo`.  Avoids a double-open for devices already in the
+    /// list — use `DeviceInfo::is_keyboard` on an existing entry instead.
+    pub fn path_is_keyboard(path: &Path) -> bool {
+        let Ok(f) = std::fs::File::open(path) else {
+            return false;
+        };
+        let Ok(dev) = Device::new_from_file(f) else {
+            return false;
+        };
+        device_is_keyboard(&dev)
+    }
+
+    /// Return all currently present keyboard devices.
+    /// No extra opens: the keyboard check is done on the `Device` already
+    /// opened by `with_path` inside `obtain_device_list`.
+    pub fn all_keyboards() -> Result<Vec<DeviceInfo>> {
+        let all = Self::obtain_device_list()?;
+        Ok(all.into_iter().filter(|d| d.is_keyboard).collect())
+    }
+
     fn obtain_device_list() -> Result<Vec<DeviceInfo>> {
         let mut devices = vec![];
         for entry in std::fs::read_dir("/dev/input")? {
@@ -99,6 +127,17 @@ impl DeviceInfo {
         });
         Ok(devices)
     }
+}
+
+/// Keyboard heuristic: has EV_KEY, reports KEY_A, and has a non-empty phys
+/// string.  Real hardware devices always have a phys set by the kernel driver.
+/// uinput virtual devices (including evremap's own output devices) have an
+/// empty phys, so this prevents evremap from grabbing its own virtual devices
+/// and entering a feedback loop.
+fn device_is_keyboard(dev: &Device) -> bool {
+    !dev.phys().unwrap_or("").is_empty()
+        && dev.has(EventType::EV_KEY)
+        && dev.has_event_code(&EventCode::EV_KEY(KeyCode::KEY_A))
 }
 
 fn event_number_from_path(path: &PathBuf) -> u32 {
