@@ -2,6 +2,23 @@
 
 *A keyboard input remapper for Linux/Wayland systems, written by <a href="https://github.com/wez/">@wez</a>*
 
+This is a fork by [@brentdurksen](https://github.com/brentdurksen) with the following changes:
+
+- **`--all-keyboards` flag** — remap every keyboard at once without specifying a device name; new keyboards are picked up automatically via inotify, disconnects are handled gracefully
+- **Bug fix** — fixed stray keypress when releasing a DualRole modifier (e.g. CAPSLOCK) before releasing the chord key; the remapped output is now held until all physical chord keys are released
+
+Pre-built binaries for `x86_64` and `aarch64` are attached to each [GitHub release](https://github.com/brentdurksen/evremap/releases).
+
+For a personal config and one-command installer built on top of this fork, see [brentdurksen/my-evremap](https://github.com/brentdurksen/my-evremap).
+
+---
+
+## Original README
+
+*Everything below is from the upstream project.*
+
+---
+
 ## Why?
 
 I couldn't find a good solution for the following:
